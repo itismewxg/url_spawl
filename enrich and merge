@@ -1,0 +1,359 @@
+import sys 
+import os
+import argparse
+import json
+import base64
+import random
+from copy import copy
+from kafka import KafkaProducer
+from kafka import KafkaConsumer
+from kafka.errors import KafkaError
+from ospreytelemetry import signals_pb2
+from google.protobuf.descriptor import FieldDescriptor
+from protobuf_to_dict import protobuf_to_dict, TYPE_CALLABLE_MAP
+import geoip2.database
+from ua_parser import user_agent_parser
+import atexit
+import time
+from datetime import datetime, timedelta
+import log
+import string
+
+
+LOGGER = log.get_logger()
+GEOIP_DATA_DIR = "/home/osprey/workspace/pipeline"
+
+user_agent_parser.MAX_CACHE_SIZE = 10000
+
+def show_pb(pb):
+    type_callable_map = copy(TYPE_CALLABLE_MAP)
+    # convert TYPE_BYTES to a Python bytestring
+    type_callable_map[FieldDescriptor.TYPE_BYTES] = str 
+                                    
+    # my_message is a google.protobuf.message.Message instance
+    dm = protobuf_to_dict(pb, type_callable_map=type_callable_map)
+    print json.dumps(dm)
+
+
+class mergemeta:
+    """
+        metafile stored 2 parts in the metafile:
+            1. checkpoint of the consumer 
+            2. the leftover dict of the joiner message
+        
+        1st line is the commited consumed offsets by merger's outputer
+        e.g.
+        ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+            <json dump of partition: [{1:1000],[2,12020],[3,787]}]>
+        ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        from the 2nd line, line by line
+        b64 for each line: <serialized pb message1>
+            -- initilization from leftover serialized data of the join dict
+            -- b64 for such string easy to be kept from reading
+    """
+    def __init__(self, mfile):
+        self.partition_offsets = {}
+        self.leftover_messages = {}
+        self.meta_file = mfile
+        if not os.path.exists(mfile):
+            return
+        else:
+            read_offset = True
+            with open(mfile, "r") as f:
+                for l in f:
+                    l = l.strip()
+                    if read_offset:
+                        self.partition_offsets = json.loads(l)
+                        read_offset = False
+                    else:
+                        jm = json.loads(l)
+                        jm["meta"]["lastmodified"] = datetime.strptime(jm["meta"]["lastmodified"], "%Y-%m-%d %H:%M:%S")
+                        sm = base64.b64decode(jm["smsg"])
+                        pb_msg = signals_pb2.Telemetry()
+                        pb_msg.ParseFromString(sm)
+                        self.leftover_messages[pb_msg.sessionToken] = \
+                                {"msg" : pb_msg, "meta":jm["meta"]}
+
+
+    def get_partition_offsets(self):
+        return self.partition_offsets
+
+    def get_leftover_pbmsg(self):
+        return self.leftover_messages
+
+    def update_partition_offset(self, p, o):
+        self.partition_offsets[p] = o
+
+    def save(self):
+        f = open(self.meta_file, "w")
+        f.write("%s\n" % json.dumps(self.partition_offsets))
+        for k, v in self.leftover_messages.items():
+            b64smsg = base64.b64encode(v["msg"].SerializeToString())
+            v["meta"]["lastmodified"] = v["meta"]["lastmodified"].strftime("%Y-%m-%d %H:%M:%S")
+            dm = {"smsg" : b64smsg, "meta":v["meta"]}
+            f.write("%s\n" % json.dumps(dm))
+        f.close()
+
+
+class hashjoin:
+    @staticmethod
+    def apply(leftover, pb):
+        stoken = pb.sessionToken
+        uv = pb.uniqv[0]
+        if stoken in leftover.keys():
+            if uv in leftover[stoken].uniqv:
+                LOGGER.warning("send twice message", {"stoken":stoken, "uniqv":uniqv})
+                return
+            else:
+                leftover[stoken].MergeFrom(pb)
+                show_pb(leftover[stoken])
+        else:
+            """
+                setup the message
+            """
+            leftover[pb.sessionToken] = pb
+            #show_pb(pb)
+
+    @staticmethod
+    def apply2(leftover, pb):
+        stoken = pb.sessionToken
+        if stoken in leftover.keys():
+            LOGGER.info("recved this token message", {"token":stoken})
+            mpb = leftover[stoken]
+            mpb["msg"].MergeFrom(pb)
+            if mpb["meta"].get("qrecv", False):
+                mpb["meta"]["merged"] = True
+            #show_pb(mpb)
+        else:
+            """  """
+            LOGGER.info("first recved this token message", {"token":stoken})
+            mpb = leftover[stoken] = {"msg": pb, "meta":{}}
+            #show_pb(pb)
+        if pb.HasField("httpReqInfo"):
+            mpb["meta"]["qrecv"] = True
+        mpb["meta"]["lastmodified"] = datetime.now()
+
+
+class enricher:
+    """ 
+        initialization to get enrich handlers
+        to do the enrich in a sequence and execute all the active handlers
+        e.g. so far,
+            -- the maxmind geoip handler
+            -- the uaparser for th ua parsing handler
+            -- url pattern to application-type
+            -- claculate out the 
+    """
+    def __init__(self):
+        self.asnReader = geoip2.database.Reader("%s/GeoLite2-ASN_20170523/GeoLite2-ASN.mmdb" % GEOIP_DATA_DIR) 
+        self.locReader = geoip2.database.Reader("%s/GeoLite2-City_20170502/GeoLite2-City.mmdb" % GEOIP_DATA_DIR)
+
+    def enrich_pb_msg(self, pb):
+        """
+            sequencely enrich message
+            1) ua
+            2) ip
+        """
+        ip = pb.httpReqInfo.ip
+        geoip = self._get_geoip_info(ip)
+    
+        try:
+            pb.httpReqInfo.geoip.asn_num = geoip["asn_num"]
+            pb.httpReqInfo.geoip.asn = geoip["asn"]
+        except Exception as e:
+            print e,"asn"
+   
+        try:
+            pb.httpReqInfo.geoip.country = geoip["country"]
+            pb.httpReqInfo.geoip.city = geoip["city"]
+            pb.httpReqInfo.geoip.postalcode = geoip["postalcode"]
+            pb.httpReqInfo.geoip.location.lon = geoip["location"]["lon"]
+            pb.httpReqInfo.geoip.location.lat = geoip["location"]["lat"]
+        except Exception as e:
+            print e,"geo"
+
+        ua = pb.httpReqInfo.ua
+        uap = self._get_parsed_uainfo(ua)
+            
+        try:
+            pb.httpReqInfo.parsedUaInfo.os.family = uap["os"]["family"]
+            pb.httpReqInfo.parsedUaInfo.os.major = uap["os"]["major"]
+            pb.httpReqInfo.parsedUaInfo.os.minor = uap["os"]["minor"]
+            pb.httpReqInfo.parsedUaInfo.os.patch = uap["os"]["patch"]
+            pb.httpReqInfo.parsedUaInfo.os.patch_minor = uap["os"]["patch_minor"]
+        except Exception as e:
+            print e,"os"
+
+        try:
+            pb.httpReqInfo.parsedUaInfo.browser.family = uap["browser"]["family"]
+            pb.httpReqInfo.parsedUaInfo.browser.major = uap["browser"]["major"]
+            pb.httpReqInfo.parsedUaInfo.browser.minor = uap["browser"]["minor"]
+            pb.httpReqInfo.parsedUaInfo.browser.patch = uap["browser"]["patch"]
+            pb.httpReqInfo.parsedUaInfo.browser.patch_minor = uap["browser"]["patch_minor"]
+        except Exception as e:
+            print e,"browser"
+
+        try: 
+            pb.httpReqInfo.parsedUaInfo.device.family = uap["device"]["family"]
+            pb.httpReqInfo.parsedUaInfo.device.brand = uap["device"]["brand"]
+            pb.httpReqInfo.parsedUaInfo.device.model = uap["device"]["model"]
+        except Exception as e:
+            print e,"device"
+
+        return pb
+        
+    def _get_parsed_uainfo(self, ua):
+        uap = {}
+        try:
+            uap["os"] = user_agent_parser.ParseOS(ua)
+            uap["device"] = user_agent_parser.ParseDevice(ua)
+            uap["browser"] = user_agent_parser.ParseUserAgent(ua)
+        except Exception as e:
+            print e
+        return uap 
+
+    def _get_geoip_info(self,ip):
+        geoip = {}
+        try:
+            asnRsp = self.asnReader.asn(ip)
+            geoip["asn_num"] = asnRsp.autonomous_system_number
+            geoip["asn"] = asnRsp.autonomous_system_organization
+            
+            locRsp = self.locReader.city(ip)
+            geoip["country"] = locRsp.country.name
+            geoip["city"] = locRsp.city.name
+            geoip["location"] = {}
+            geoip["location"]["lon"] = locRsp.location.longitude
+            geoip["location"]["lat"] = locRsp.location.latitude
+            geoip["postalcode"] = locRsp.postal.code
+        except Exception as e:
+            print e
+        return geoip
+
+
+class kreader:
+    """ 
+        initialze and prepare the reader
+        get the infinite loop iterator to get the message
+    """
+    def __init__(self, topic, group, brokers, offsets):
+        self.topic = topic
+        self.consumer = KafkaConsumer(topic, group_id=group, bootstrap_servers=brokers, auto_offset_reset='latest')
+        for offset in offsets:
+            consumer.seek(offset['offset'], whence=0, partition=offset['partition'])
+
+    def msg_iterator(self):
+        return self.consumer
+
+    def get_messages(self, count=1, timeout=0.1):
+        dm = self.consumer.poll(timeout_ms=timeout*1000, max_records=count)
+        #print "dm message", dm
+        records = []
+        for k, v in dm.items():
+            records.extend(v)
+        print "get message this many: ", len(records)
+        return records
+
+class kwriter:
+    TIMEOUT1 = 5
+    TIMEOUT2 = 60
+    TIMEOUT3 = 120
+    """
+        hold the producer to the kafka
+        for each round, check the message holder, in case
+        1) query message recved
+        2.0) query message merged with signal message
+        2.1) query message waited more than 1 minute
+        send messages complied to this critias out to the downstream
+        TODO:
+        handle query message sent 2 times
+        later handle query message from client (multiple click of login), assocaited with signals from other group message
+    """
+    def __init__(self, otopic, brokers):
+        self.producer = KafkaProducer(bootstrap_servers=brokers)
+        self.otopic = otopic
+
+    def _make_padding(self):
+        return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+
+    
+    def _check_timediff(self, last):
+        n = datetime.now()
+        return  (n - last).total_seconds()
+
+    def write(self, msg_holder):
+        """
+           1) send the signals only message with timeout1 (2m), and change 
+              the sessionToken with a 4-letters random padding
+           2) send the query message with merged signals with timeout1 (5s)
+           3) send the query only message with a timeout2 (1m)
+        """
+        print "before", len(msg_holder)
+        for token, msg in msg_holder.items():
+            
+            if( msg["meta"].get("qrecv", False) and msg["meta"].get("merged", False) and \
+                (self._check_timediff(msg["meta"].get("lastmodified")) > self.TIMEOUT1) \
+                or \
+                ((msg["meta"].get("qrecv", False) and \
+                self._check_timediff(msg["meta"]["lastmodified"]) > self.TIMEOUT2))):
+                LOGGER.info("send enrich to kafka", {"token":token, "meta":msg["meta"]})
+                self.producer.send(self.otopic, key="osprey-test", value=msg["msg"].SerializeToString())
+                del msg_holder[token]
+
+            elif ((not msg["meta"].get("qrecv", False)) and \
+                self._check_timediff(msg["meta"]["lastmodified"]) > self.TIMEOUT3):
+                msg["msg"].sessionToken = msg["msg"].sessionToken+self._make_padding()
+                LOGGER.info("send enrich to kafka", {"token":token, "meta":msg["meta"]})
+                self.producer.send(self.otopic, key="osprey-test", value=msg["msg"].SerializeToString())
+                del msg_holder[token]
+        print "after", len(msg_holder)
+        #msg_holder[:] = [m for m in msg_holder if not m["meta"].get("remove", False)]
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="enrich and merge messages ")
+    parser.add_argument("-f", "--conf", type=file, help="", required=True)
+    parser.add_argument("-c", "--customer", type=str, help="", default="group")
+    parser.add_argument("-v", "--verbosity", action="count", default=0)
+    return parser
+
+def main():
+
+    meta = mergemeta("metafile")
+    enrich = enricher() 
+    # To consume latest messages and auto-commit offsets
+    r = kreader('osprey', 'merger', ['localhost:9092'], meta.get_partition_offsets())
+    w = kwriter('mergedEnrichRequest', ['localhost:9092'])
+
+    atexit.register(meta.save)
+    while(True):
+        LOGGER.info("consume a round in enrich-merge")
+        messages = []
+        try:
+            messages = r.get_messages(100, 10)
+            print "get message of : ",len(messages)
+        except Exception as e:
+            print "sth wrong", e
+        for message in messages:
+            # message value and key are raw bytes -- decode if necessary!
+            # e.g., for unicode: `message.value.decode('utf-8')`
+            LOGGER.warning("get message", {"topic": message.topic, "part" : message.partition,
+                "offset": message.offset, "key":message.key})
+            
+            #print message
+            print len(message.value)
+            
+            try:
+                pb_msg = signals_pb2.Telemetry()
+                pb_msg.ParseFromString(message.value)
+                if pb_msg.HasField("httpReqInfo"):
+                    pb_msg = enrich.enrich_pb_msg(pb_msg)
+                hashjoin.apply2(meta.get_leftover_pbmsg(), pb_msg)
+            except Exception as e:
+                print "sth wrong", e
+                #exit(-1)
+        w.write(meta.get_leftover_pbmsg())    
+
+if __name__ == '__main__':
+    main()
+
